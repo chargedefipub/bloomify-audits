@@ -82,7 +82,9 @@ contract AccumulatorStrategyRunner is
     // Tracks deposit amounts
     uint256 public totalDeposits;
     mapping(address => uint256) public userDeposits;
-    uint256 public depositPrecision = 1e18;
+
+    // Deposit precision for each Block Index => Precision
+    mapping(uint256 => uint256) public depositPrecision;
 
     // Tracks user's earnings info for each accumulator block
     mapping(uint256 => mapping(address => UserInfo)) public userInfo;
@@ -226,12 +228,27 @@ contract AccumulatorStrategyRunner is
     /**
      * @dev Additional initialization required for Vamp Vaults
      */
-    function initializeVaultStrat(uint256 _depositTokenPrecision)
-        external
-        nonReentrant
-    {
+    function initializeVaultStrat(
+        address _strategyOwner,
+        uint256[] calldata _depositTokenPrecision
+    ) external nonReentrant onlyOwner {
         require(!vaultInitialized, "Already initialized");
-        depositPrecision = _depositTokenPrecision;
+
+        transferOwnership(_strategyOwner);
+
+        _grantRole(DEFAULT_ADMIN_ROLE, _strategyOwner);
+        _grantRole(RUNNER_ROLE, _strategyOwner);
+
+        require(
+            _depositTokenPrecision.length == blocks.length,
+            "Num precisions must match block length"
+        );
+
+        for (uint256 i = 0; i < _depositTokenPrecision.length; i++) {
+            require(_depositTokenPrecision[i] > 0, "Precision cannot be zero");
+            depositPrecision[i] = _depositTokenPrecision[i];
+        }
+
         vaultInitialized = true;
     }
 
@@ -266,8 +283,11 @@ contract AccumulatorStrategyRunner is
         uint256 _blockIndex, // Hack: _blockIndex Ignored - always deposits into block 0 (deposit block)
         uint256 _minOutAmount
     ) external override nonReentrant {
+        require(vaultInitialized, "Initialization incomplete");
         require(_amount > 0, "Amount must be > 0");
         require(_blockIndex == 0, "Deposits allowed only in block 0");
+
+        _bankEarnings(msg.sender);
 
         uint256 amtBefore = IERC20(_token).balanceOf(address(this));
         SafeERC20.safeTransferFrom(
@@ -319,8 +339,11 @@ contract AccumulatorStrategyRunner is
         override
         nonReentrant
     {
+        require(vaultInitialized, "Initialization incomplete");
         require(msg.value > 0, "Amount must be > 0");
         require(_blockIndex == 0, "Deposits allowed only in block 0");
+
+        _bankEarnings(msg.sender);
 
         uint256 blockBalBef = blocks[_blockIndex].balance();
         bool deposited = blocks[_blockIndex].depositEther{value: msg.value}(
@@ -378,12 +401,7 @@ contract AccumulatorStrategyRunner is
 
         // ----- Block 0 - Withdraw from deposit block
         if (_blockIndex == 0) {
-            bool isSuccess = _withdrawDepositOnly(_user, _amount);
-            if (isSuccess) {
-                // Bank the rest of the earnings from other blocks to
-                // avoid additional compounding yield calcs
-                _bankEarnings(_user);
-            }
+            _withdrawDepositOnly(_user, _amount);
         }
         // ----- Blocks 1 and above -  Withdraw from accumulator block
         // Hack : Amount is ignored. The full amount must be withdrawn to avoid handling
@@ -394,6 +412,7 @@ contract AccumulatorStrategyRunner is
             uint256 shareAmt = _blockEarnings(_user, _blockIndex).add(
                 userInfo[_blockIndex][_user].bankedAmount
             );
+
             if (shareAmt > 0) {
                 uint256 wantBalBef = bankBlock.wantBalance();
                 uint256 amtInput = bankBlock.withdrawalInputType() == 0
@@ -402,15 +421,18 @@ contract AccumulatorStrategyRunner is
                 bool bankSuccess = IBlock(address(bankBlock)).withdraw(
                     amtInput
                 );
-                uint256 actualWantAmtWithdrawn = bankBlock.wantBalance().sub(
-                    wantBalBef
-                );
+
                 require(bankSuccess, "unable to withdraw earnings");
+                uint256 actualWantAmtWithdrawn = wantBalBef.sub(
+                    bankBlock.wantBalance()
+                );
+
                 _transferBlockTokens(
                     _user,
                     IBlock(address(bankBlock)),
                     actualWantAmtWithdrawn
                 );
+
                 // > Reset debt & banked amounts
                 _resetUserYieldDebt(_user, _blockIndex);
                 userInfo[_blockIndex][_user].bankedAmount = 0;
@@ -431,13 +453,17 @@ contract AccumulatorStrategyRunner is
         require(_amount > 0, "Amount cannot be 0");
         require(_amount <= userDeposits[_user], "Amount more than deposits");
 
-        uint256 blockBalBef = IERC20(blocks[0].getDepositToken()).balanceOf(
-            address(blocks[0])
+        _bankEarnings(_user);
+
+        uint256 blockBalBef = _getWithdrawBalBeforeAfter(
+            blocks[0],
+            blocks[0].getDepositToken()
         );
         bool success = blocks[0].withdraw(_amount);
-        uint256 actualAmount = IERC20(blocks[0].getDepositToken())
-            .balanceOf(address(blocks[0]))
-            .sub(blockBalBef);
+        uint256 actualAmount = _getWithdrawBalBeforeAfter(
+            blocks[0],
+            blocks[0].getDepositToken()
+        ).sub(blockBalBef);
         if (success) {
             // Transfer token back to the user
             _transferBlockTokens(_user, blocks[0], actualAmount);
@@ -448,6 +474,7 @@ contract AccumulatorStrategyRunner is
                 ? userDeposits[_user].sub(actualAmount)
                 : 0;
 
+            _resetUserYieldDebtAllBlocks(_user);
             emit WithdrawDeposit(_user, block.timestamp, actualAmount);
             return true;
         } else {
@@ -590,9 +617,6 @@ contract AccumulatorStrategyRunner is
                     .bankedAmount
                     .add(earnings);
             }
-
-            // ----- 3) Zero out any earnings in the accumulator blocks to prevent a user from reclaiming
-            _resetUserYieldDebt(_user, i);
         }
     }
 
@@ -607,7 +631,7 @@ contract AccumulatorStrategyRunner is
         if (userDeposits[_user] > 0) {
             uint256 earningsBeforeDebt = userDeposits[_user]
                 .mul(blockInfo[_blockIndex].accYieldPerToken)
-                .div(depositPrecision);
+                .div(depositPrecision[_blockIndex]);
             if (userInfo[_blockIndex][_user].yieldDebt < earningsBeforeDebt) {
                 return
                     earningsBeforeDebt.sub(
@@ -625,7 +649,16 @@ contract AccumulatorStrategyRunner is
         require(_blockIndex != 0, "Yield Debt - Block 0 not allowed");
         userInfo[_blockIndex][_user].yieldDebt = userDeposits[_user]
             .mul(blockInfo[_blockIndex].accYieldPerToken)
-            .div(depositPrecision);
+            .div(depositPrecision[_blockIndex]);
+    }
+
+    /**
+     * @dev Resets the yield debt on all accumulator blocks
+     */
+    function _resetUserYieldDebtAllBlocks(address _user) private {
+        for (uint256 i = 1; i < blocks.length; i++) {
+            _resetUserYieldDebt(_user, i);
+        }
     }
 
     /* ==========================================
@@ -815,10 +848,14 @@ contract AccumulatorStrategyRunner is
         uint256 sharesIncrease = bankBlock.shareBalance().sub(sharesBefore);
 
         // Update the yield per share with the increase in bank shares
+        // NOTE: Need to handle divide by 0 total deposit issue if allowing accumulator
+        // blocks to use REINVEST function in future.
         blockInfo[_action.toBlockId].accYieldPerToken = blockInfo[
             _action.toBlockId
         ].accYieldPerToken.add(
-                sharesIncrease.mul(depositPrecision).div(totalDeposits)
+                sharesIncrease.mul(depositPrecision[_action.toBlockId]).div(
+                    totalDeposits
+                )
             );
 
         if (success) {
@@ -886,8 +923,24 @@ contract AccumulatorStrategyRunner is
         }
         // ----- Handle ether deposit token case
         else {
-            (bool sent, ) = _receiver.call{value: _amount}("");
+            (bool sent, ) = payable(_receiver).call{value: _amount}("");
             require(sent, "Failed to send Ether");
+        }
+    }
+
+    /**
+     * @dev Helper function to get the balance of a token
+     *  which could be ERC20 or native BNB/ether
+     */
+    function _getWithdrawBalBeforeAfter(IBlock _block, address _token)
+        private
+        view
+        returns (uint256)
+    {
+        if (_token != address(0)) {
+            return IERC20(_token).balanceOf(address(_block));
+        } else {
+            return address(this).balance;
         }
     }
 
@@ -896,9 +949,9 @@ contract AccumulatorStrategyRunner is
      * general deposit state of the runner
      */
     function _updateDeposits(address _user, uint256 _depositAmount) private {
-        _bankEarnings(_user);
         totalDeposits = totalDeposits.add(_depositAmount);
         userDeposits[_user] = userDeposits[_user].add(_depositAmount);
+        _resetUserYieldDebtAllBlocks(_user);
     }
 
     /* ==========================================
