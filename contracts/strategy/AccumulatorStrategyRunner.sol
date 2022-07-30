@@ -491,10 +491,7 @@ contract AccumulatorStrategyRunner is
 		}
 	}
 
-	function _withdrawDepositOnly(address _user, uint256 _amount)
-		private
-		returns (bool)
-	{
+	function _withdrawDepositOnly(address _user, uint256 _amount) private {
 		require(_amount > 0, 'Amount cannot be 0');
 		require(_amount <= userDeposits[_user], 'Amount more than deposits');
 
@@ -524,10 +521,8 @@ contract AccumulatorStrategyRunner is
 			runningWithdrawals[0] = runningWithdrawals[0].add(actualAmount);
 
 			emit WithdrawDeposit(_user, block.timestamp, actualAmount);
-			return true;
 		} else {
 			emit BlockWithdrawalFailed(_user, block.timestamp, 0);
-			return false;
 		}
 	}
 
