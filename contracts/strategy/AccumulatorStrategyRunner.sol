@@ -1004,6 +1004,7 @@ contract AccumulatorStrategyRunner is
 	) private {
 		uint256 allowance = IERC20(_token).allowance(address(this), _spender);
 		if (allowance < amountToSpend) {
+                        SafeERC20.safeApprove(IERC20(_token), _spender, 0);
 			SafeERC20.safeApprove(IERC20(_token), _spender, type(uint256).max);
 		}
 	}
